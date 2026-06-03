@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($py = \\(Get-Command python -ErrorAction SilentlyContinue\\); if \\($py\\) { python -m py_compile lambda_a\\\\handler.py; if \\($?\\) { \"OK: compiled\" } } else { \"python not found\" })",
+      "PowerShell(python -m py_compile lambda_a\\\\handler.py lambda_b\\\\handler.py; if \\($?\\) { \"compile OK\" }; python lambda_a\\\\_smoke_test.py; python lambda_b\\\\_smoke_test.py)",
+      "PowerShell(aws sts get-caller-identity *)",
+      "Bash(python lambda_b/_smoke_test.py)"
+    ]
+  }
+}
