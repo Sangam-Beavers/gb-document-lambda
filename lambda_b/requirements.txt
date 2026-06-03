@@ -1,0 +1,4 @@
+# boto3는 Lambda Python 3.12 런타임에 내장.
+# development 경로(온프렘 MySQL 직접 INSERT)에서만 필요한 순수 파이썬 드라이버.
+# production 전용 배포라면 생략 가능(코드에서 지연 import).
+PyMySQL>=1.1
