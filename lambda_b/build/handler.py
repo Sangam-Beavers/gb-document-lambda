@@ -9,7 +9,7 @@ Lambda B — 법령 RAG 분석 + 번역 + 결과 경로 분기 (계정 B AI 분�
     → 결과 JSON 조립 (document_results 컬럼 매핑)
     → source로 한 경로 전송 (택일, 동시 전송 아님)
         · production  → result_queue_arn SQS 발행 (body=결과JSON, attr=source/document_public_id)
-        · development → EC2 HAProxy → WireGuard → 온프렘 MySQL 직접 INSERT
+        · development → VPC 라우트(WireGuard EC2) → 터널 → 온프렘 MySQL 직접 INSERT
 
 원본 S3 삭제(PII Layer 3)는 Lambda A 책임으로 이관됨(마스킹본 저장 직후 삭제).
 B는 페이로드의 masked_text로만 분석하므로 원본을 갖지 않는다.
@@ -37,7 +37,7 @@ KB_NUM_RESULTS = int(os.environ.get("KB_NUM_RESULTS", "5"))
 MAX_TOKENS = int(os.environ.get("BEDROCK_MAX_TOKENS", "8000"))
 MAX_TOOL_TURNS = int(os.environ.get("MAX_TOOL_TURNS", "8"))  # Tool Use 루프 폭주 방지
 
-# 개발기(development) 경로 — 온프렘 MySQL (EC2 HAProxy → WireGuard 너머)
+# 개발기(development) 경로 — 온프렘 MySQL (WireGuard EC2 터널 너머, HAProxy 미사용)
 DB_HOST = os.environ.get("ONPREM_DB_HOST", "")     # 계정 B EC2 프라이빗 IP
 DB_PORT = int(os.environ.get("ONPREM_DB_PORT", "3306"))
 DB_USER = os.environ.get("ONPREM_DB_USER", "")
@@ -280,35 +280,62 @@ def _send_to_sqs(queue_arn, result):
 
 
 def _insert_onprem_mysql(result):
-    """development 경로. EC2 프라이빗 IP:3306 → HAProxy → WireGuard → 온프렘 MySQL.
+    """development 경로. VPC 라우트(10.10.1.0/24 → WireGuard EC2) → 터널 → 온프렘 MySQL.
+    (HAProxy 미사용 — EC2는 WireGuard 터널 엔드포인트일 뿐.)
 
-    ⚠️ 온프렘 document_submissions/document_results 스키마는 gb-backend 소관이라
-    이 레포에 정의가 없다. 아래 컬럼/SQL은 api-spec §3 결과 필드 기준 best-effort이며,
-    배포 전 실제 스키마와 1:1 대조 후 확정해야 한다. (nested는 JSON 컬럼 가정)
-    TODO(스키마): submission_id/public_id 키, JSON 컬럼 여부, NOT NULL 제약 확인.
+    연결 (실측 확정 2026-06):
+    - **TLS 끔(평문 고정) — `ssl_disabled=True` 필수.** WireGuard 경로에서 TLS 핸드셰이크가
+      MTU 문제로 멈춤 → 서버 평문 허용 확인됨. ⚠️ ssl 인자를 "안 주는 것"으로는 부족하다:
+      번들 PyMySQL 1.2.0은 인자 미지정 시 PREFERRED 모드라 서버가 SSL을 광고하면(MySQL 8은
+      평문 허용이어도 항상 광고) TLS를 시도한다 → ssl_disabled=True로 명시해야 진짜 평문.
+      MySQL 8 caching_sha2_password는 PyMySQL이 평문에서도 RSA 공개키 교환으로 자동 인증
+      (Connector/J의 allowPublicKeyRetrieval=true와 동일 메커니즘 — 별도 플래그 불필요).
+
+    스키마 (온프렘 document_db 설계 문서와 1:1 대조 확정, 2026-06-04):
+    - document_results엔 document_public_id 컬럼이 없다 → `submission_id`(BIGINT NOT NULL
+      UNIQUE FK). public_id로 document_submissions.id를 먼저 조회해 넣는다.
+    - 마스킹본 컬럼은 `s3_masked_key` — 경로(key)만 저장(s3://버킷 접두사 제거). 조회 시
+      백엔드가 presigned URL 생성. analysis_document_type 컬럼은 results에 없음(submissions 소유).
+    - completed_at은 DATETIME NOT NULL — ISO 'T'/'Z' 제거 변환, FAILED(None)면 현재 시각 대체.
+    - **document_submissions.status는 건드리지 않는다** — 전송 전 상태 전용(UPLOADED/
+      SENT_TO_AWS/FAILED_UPLOAD). 분석 상태 SSOT는 document_results.processing_status.
     """
     import pymysql  # 지연 import — production 전용 배포에선 미번들 가능
 
+    # completed_at NOT NULL — FAILED(None)여도 기록 시각으로 채운다.
+    completed_at = (result["completed_at"] or _utc_now_iso()).replace("T", " ").rstrip("Z")
+    failed_reason = result["failed_reason"]
+    if failed_reason:
+        failed_reason = failed_reason[:255]  # VARCHAR(255)
+
     conn = pymysql.connect(
         host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD,
-        database=DB_NAME, autocommit=False, connect_timeout=10,
+        database=DB_NAME, charset="utf8mb4", autocommit=False,
+        connect_timeout=10, read_timeout=15, write_timeout=15,  # 무응답 행 방지 — 빠른 에러
+        ssl_disabled=True,  # ⚠️ 필수 — PyMySQL 1.2.0은 미지정 시 PREFERRED(TLS 시도). docstring 참고.
     )
     try:
         with conn.cursor() as cur:
-            # 1) 상태 동기화 (PARTIAL은 COMPLETED로 간주 — Consumer 규약과 동일)
-            sub_status = "FAILED" if result["processing_status"] == "FAILED" else "COMPLETED"
+            # 1) public_id → document_submissions.id (document_results.submission_id FK NOT NULL)
             cur.execute(
-                f"UPDATE {TBL_SUBMISSIONS} SET status=%s WHERE public_id=%s",
-                (sub_status, result["document_public_id"]),
+                f"SELECT id FROM {TBL_SUBMISSIONS} WHERE public_id=%s",
+                (result["document_public_id"],),
             )
-            # 2) 결과 UPSERT (멱등 — public_id UNIQUE 가정)
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(
+                    f"submission not found in onprem DB: public_id={result['document_public_id']}"
+                )
+            submission_id = row[0]
+
+            # 2) 결과 UPSERT (submission_id UNIQUE로 멱등). submissions.status UPDATE 없음 — docstring 참고.
             cur.execute(
                 f"""
                 INSERT INTO {TBL_RESULTS}
-                    (document_public_id, analysis_document_type, processing_status,
-                     overall_risk_level, ocr_confidence, wage_summary, risk_items,
-                     translated_text, masked_file_url, failed_reason, completed_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    (submission_id, processing_status, overall_risk_level, ocr_confidence,
+                     wage_summary, risk_items, translated_text, s3_masked_key,
+                     failed_reason, completed_at, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(6),NOW(6))
                 ON DUPLICATE KEY UPDATE
                     processing_status=VALUES(processing_status),
                     overall_risk_level=VALUES(overall_risk_level),
@@ -316,26 +343,27 @@ def _insert_onprem_mysql(result):
                     wage_summary=VALUES(wage_summary),
                     risk_items=VALUES(risk_items),
                     translated_text=VALUES(translated_text),
-                    masked_file_url=VALUES(masked_file_url),
+                    s3_masked_key=VALUES(s3_masked_key),
                     failed_reason=VALUES(failed_reason),
-                    completed_at=VALUES(completed_at)
+                    completed_at=VALUES(completed_at),
+                    updated_at=NOW(6)
                 """,
                 (
-                    result["document_public_id"],
-                    result["analysis_document_type"],
+                    submission_id,
                     result["processing_status"],
                     result["overall_risk_level"],
                     result["ocr_confidence"],
                     json.dumps(result["wage_summary"], ensure_ascii=False) if result["wage_summary"] else None,
                     json.dumps(result["risk_items"], ensure_ascii=False),
                     result["translated_text"],
-                    result["masked_file_url"],
-                    result["failed_reason"],
-                    result["completed_at"],
+                    _s3_uri_to_key(result["masked_file_url"]),
+                    failed_reason,
+                    completed_at,
                 ),
             )
         conn.commit()
-        logger.info("onprem MySQL insert ok: %s", result["document_public_id"])
+        logger.info("onprem MySQL insert ok: %s (submission_id=%s)",
+                    result["document_public_id"], submission_id)
     except Exception:
         conn.rollback()
         raise
@@ -351,6 +379,16 @@ def _arn_to_queue_url(arn):
         raise ValueError(f"invalid SQS ARN: {arn}")
     region, account, name = parts[3], parts[4], parts[5]
     return f"https://sqs.{region}.amazonaws.com/{account}/{name}"
+
+
+def _s3_uri_to_key(uri):
+    """'s3://bucket/masked/a.txt' → 'masked/a.txt'. 온프렘 s3_masked_key엔 경로(key)만 저장."""
+    if not uri:
+        return None
+    if uri.startswith("s3://"):
+        rest = uri[5:]
+        return rest.split("/", 1)[1] if "/" in rest else rest
+    return uri
 
 
 def _utc_now_iso():

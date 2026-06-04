@@ -4,7 +4,10 @@
       "PowerShell($py = \\(Get-Command python -ErrorAction SilentlyContinue\\); if \\($py\\) { python -m py_compile lambda_a\\\\handler.py; if \\($?\\) { \"OK: compiled\" } } else { \"python not found\" })",
       "PowerShell(python -m py_compile lambda_a\\\\handler.py lambda_b\\\\handler.py; if \\($?\\) { \"compile OK\" }; python lambda_a\\\\_smoke_test.py; python lambda_b\\\\_smoke_test.py)",
       "PowerShell(aws sts get-caller-identity *)",
-      "Bash(python lambda_b/_smoke_test.py)"
+      "Bash(python lambda_b/_smoke_test.py)",
+      "PowerShell(Copy-Item *)",
+      "PowerShell($a = Get-ChildItem lambda_b\\\\build\\\\pymysql -Recurse -File | Where-Object { $_.FullName -notmatch '__pycache__' } | Sort-Object FullName; $b = Get-ChildItem gb-document-analysis-patched\\\\pymysql -Recurse -File | Where-Object { $_.FullName -notmatch '__pycache__' } | Sort-Object FullName; Write-Output \"py files - build: $\\($a.Count\\), patched: $\\($b.Count\\)\"; $ha = \\($a | Get-FileHash | Select-Object -ExpandProperty Hash\\) -join ','; $hb = \\($b | Get-FileHash | Select-Object -ExpandProperty Hash\\) -join ','; if \\($ha -eq $hb\\) { Write-Output \"pymysql IDENTICAL \\(hash match\\)\" } else { Write-Output \"pymysql DIFFERS\" })",
+      "PowerShell($repo = \\(Get-FileHash lambda_b\\\\handler.py\\).Hash; $build = \\(Get-FileHash lambda_b\\\\build\\\\handler.py\\).Hash; Add-Type -AssemblyName System.IO.Compression.FileSystem; $zip = [System.IO.Compression.ZipFile]::OpenRead\\(\\(Resolve-Path 'lambda_b\\\\build\\\\lambda_b.zip'\\).Path\\); $h = $zip.Entries | Where-Object { $_.FullName -eq 'handler.py' }; $ms = New-Object System.IO.MemoryStream; $s = $h.Open\\(\\); $s.CopyTo\\($ms\\); $s.Close\\(\\); $ms.Position = 0; $sha = [System.Security.Cryptography.SHA256]::Create\\(\\); $zipHash = \\([System.BitConverter]::ToString\\($sha.ComputeHash\\($ms\\)\\)\\) -replace '-',''; $zip.Dispose\\(\\); Write-Output \"repo : $repo\"; Write-Output \"build: $build\"; Write-Output \"zip  : $zipHash\"; if \\($repo -eq $build -and $build -eq $zipHash\\) { Write-Output \">>> 3개 모두 동일\" } else { Write-Output \">>> 불일치 있음\" })"
     ]
   }
 }

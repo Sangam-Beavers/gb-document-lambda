@@ -46,6 +46,12 @@ res_f = h._build_result(event, {"processing_status": "FAILED", "risk_items": [],
 assert res_f["completed_at"] is None
 assert res_f["failed_reason"] == "x"
 
+# s3:// URI → key (온프렘 s3_masked_key 컬럼은 경로만 저장)
+assert h._s3_uri_to_key("s3://b/masked/doc-1.txt") == "masked/doc-1.txt", h._s3_uri_to_key("s3://b/masked/doc-1.txt")
+assert h._s3_uri_to_key("masked/doc-1.txt") == "masked/doc-1.txt"
+assert h._s3_uri_to_key(None) is None
+assert h._s3_uri_to_key("") is None
+
 # redact는 masked_text 제거
 assert "masked_text" not in h._redact(event)
 assert h._redact(event)["document_id"] == "doc-1"

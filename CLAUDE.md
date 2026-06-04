@@ -85,7 +85,7 @@ AI 서류 분석 파이프라인 **Lambda 코드** 레포. (handoff 문서의 `s
 - `source=production` → **`result_queue_arn` 큐로 SendMessage** (백엔드가 심은 ARN 그대로 사용. Lambda는 환경 매핑 테이블 불필요).
   - 큐는 `gb-analysis-results-stage` / `gb-analysis-results-prod`로 **물리 분리**. 각 환경 백엔드가 자기 큐만 구독.
   - **페이로드 위치 규약:** 결과 JSON은 **SQS 메시지 본문 그대로**, 라우팅 메타(`source`, `document_public_id`)는 **SQS MessageAttributes**로.
-- `source=development` → 계정 B EC2(HAProxy) → WireGuard 터널 → **온프렘 개발기 MySQL 직접 INSERT**.
+- `source=development` → VPC 라우트(10.10.1.0/24 → WireGuard EC2) → 터널 → **온프렘 개발기 MySQL 직접 INSERT**. (**HAProxy 미사용** — EC2는 WireGuard 터널 엔드포인트일 뿐.)
 
 > `source`는 `production`/`development` **2값뿐.** stage 전용 값 없음(stage·prod 모두 `production`, 어느 Aurora인지는 큐가 가름). 챗봇의 3값 `environment`와는 **별개 필드** — 합치지 말 것.
 
@@ -128,7 +128,7 @@ infra/                                   # (선택) Terraform/CDK — 미생성
 ### 운영 전환 전 확정할 TODO (코드 주석에 표시됨)
 - A: `source`/`document_id`·VLM 실패 시 **FAILED 기록**(현재 데모는 로그+예외만, SQS/DB 권한 없음).
 - A: 배포 후 `head_object` 실제 메타키 이름 로그 확인 → 백엔드와 1:1 통일.
-- B: 온프렘 `document_submissions`/`document_results` **실제 스키마와 SQL 대조**(현재 best-effort, JSON 컬럼 가정).
+- B: ✅ 온프렘 스키마 대조 완료(2026-06-04, 설계 문서 기준) — `document_results`는 `submission_id`(BIGINT NOT NULL UNIQUE FK, `document_public_id` 컬럼 없음) → public_id→id 선조회. 마스킹본은 `s3_masked_key`(경로만, s3://버킷 접두사 제거). `completed_at` DATETIME NOT NULL(ISO→`YYYY-MM-DD HH:MM:SS` 변환, FAILED면 현재시각 대체). `analysis_document_type` 컬럼은 results에 없음(submissions `document_type` 소유). **`document_submissions.status`는 B가 건드리지 않음**(UPLOADED/SENT_TO_AWS/FAILED_UPLOAD 전용 — 분석 상태 SSOT는 `document_results.processing_status`). MySQL 연결은 **평문 고정 — `ssl_disabled=True` 필수**(ssl 인자 "생략"만으론 부족: PyMySQL 1.2.0은 미지정 시 PREFERRED 모드라 서버가 SSL 광고하면 TLS 시도 → WireGuard MTU에서 핸드셰이크 행. caching_sha2는 평문에서도 공개키 교환으로 자동 인증).
 - B: ✅ KB `retrieve` 실동작 확인(2026-06). 남은 건 `LEGAL_KB_ID`·`UPLOAD_BUCKET` env 주입뿐.
 - A·B 공통: `analysis_document_type` 메타키 백엔드 합의(§3-B).
 

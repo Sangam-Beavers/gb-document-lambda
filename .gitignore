@@ -4,3 +4,7 @@ docs/
 # IDE / 로컬 설정 (보통 제외 권장 — 필요 없으면 지우세요)
 .idea/
 .claude/
+
+lambda_b/build/
+__pycache__/
+*.zip
