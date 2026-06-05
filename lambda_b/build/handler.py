@@ -297,8 +297,13 @@ def _insert_onprem_mysql(result):
     - 마스킹본 컬럼은 `s3_masked_key` — 경로(key)만 저장(s3://버킷 접두사 제거). 조회 시
       백엔드가 presigned URL 생성. analysis_document_type 컬럼은 results에 없음(submissions 소유).
     - completed_at은 DATETIME NOT NULL — ISO 'T'/'Z' 제거 변환, FAILED(None)면 현재 시각 대체.
-    - **document_submissions.status는 건드리지 않는다** — 전송 전 상태 전용(UPLOADED/
-      SENT_TO_AWS/FAILED_UPLOAD). 분석 상태 SSOT는 document_results.processing_status.
+    - **document_submissions.status도 함께 갱신한다** (2026-06-05 수정). 백엔드 GET /status
+      폴링은 submissions.status(ANALYZING/COMPLETED/FAILED)만 읽으므로, results만 INSERT하면
+      프론트가 영원히 "분석 중"에 머문다(실측). 운영 경로의 SQS Consumer
+      (gb-backend AnalysisResultIngestServiceImpl §4)와 동일 매핑: FAILED→FAILED,
+      COMPLETED/PARTIAL→COMPLETED. 같은 트랜잭션으로 원자 커밋.
+      (이전 docstring의 "UPLOADED/SENT_TO_AWS/FAILED_UPLOAD 전용" 전제는 백엔드 실제
+      enum과 불일치한 오류였음 — 그런 상태값은 백엔드에 존재하지 않는다.)
     """
     import pymysql  # 지연 import — production 전용 배포에선 미번들 가능
 
@@ -328,7 +333,7 @@ def _insert_onprem_mysql(result):
                 )
             submission_id = row[0]
 
-            # 2) 결과 UPSERT (submission_id UNIQUE로 멱등). submissions.status UPDATE 없음 — docstring 참고.
+            # 2) 결과 UPSERT (submission_id UNIQUE로 멱등).
             cur.execute(
                 f"""
                 INSERT INTO {TBL_RESULTS}
@@ -360,6 +365,16 @@ def _insert_onprem_mysql(result):
                     failed_reason,
                     completed_at,
                 ),
+            )
+
+            # 3) submissions.status 동기화 — 운영 SQS Consumer와 동일 매핑(docstring 참고).
+            #    이게 없으면 백엔드 GET /status가 ANALYZING으로 남아 프론트 폴링이 끝나지 않는다.
+            submission_status = (
+                "FAILED" if result["processing_status"] == "FAILED" else "COMPLETED"
+            )
+            cur.execute(
+                f"UPDATE {TBL_SUBMISSIONS} SET status=%s, updated_at=NOW(6) WHERE id=%s",
+                (submission_status, submission_id),
             )
         conn.commit()
         logger.info("onprem MySQL insert ok: %s (submission_id=%s)",
