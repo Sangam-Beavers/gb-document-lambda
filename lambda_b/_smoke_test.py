@@ -40,6 +40,10 @@ assert res["document_public_id"] == "doc-1"
 assert res["processing_status"] == "COMPLETED"
 assert res["completed_at"] and res["completed_at"].endswith("Z")
 assert res["masked_file_url"] == "s3://b/masked/doc-1.txt"
+# v1.1 필수 필드 — schema_version(Consumer 검증) + translated_lang(user_lang 미지정 시 ko)
+assert res["schema_version"] == "1.1"
+assert res["translated_lang"] == "ko"
+assert h._build_result({**event, "user_lang": "vi"}, {"processing_status": "COMPLETED", "risk_items": []})["translated_lang"] == "vi"
 
 # FAILED는 completed_at null
 res_f = h._build_result(event, {"processing_status": "FAILED", "risk_items": [], "failed_reason": "x"})
