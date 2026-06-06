@@ -236,6 +236,7 @@ def _build_result(event, analysis):
     """모델 산출 + 파이프라인 메타를 합쳐 백엔드 계약 JSON으로 만든다."""
     status = analysis.get("processing_status", "COMPLETED")
     return {
+        "schema_version": "1.1",  # result-json-schema-agreement.md §2 — Consumer가 검증하는 필수 필드
         "document_public_id": event.get("document_id"),
         "analysis_document_type": event.get("analysis_document_type") or "UNKNOWN",
         "processing_status": status,
@@ -244,6 +245,8 @@ def _build_result(event, analysis):
         "wage_summary": analysis.get("wage_summary"),
         "risk_items": analysis.get("risk_items", []),
         "translated_text": analysis.get("translated_text"),
+        # 번역 대상 언어 = user_lang (v1.1 필수 필드, 데모 "ko" 고정).
+        "translated_lang": event.get("user_lang") or "ko",
         # masked_file_url은 Lambda A가 만든 s3:// URI. 사용자 노출용 Pre-signed 변환은 백엔드 조회 시점 처리.
         "masked_file_url": event.get("masked_file_url"),
         "failed_reason": analysis.get("failed_reason"),
@@ -295,7 +298,14 @@ def _insert_onprem_mysql(result):
     - document_results엔 document_public_id 컬럼이 없다 → `submission_id`(BIGINT NOT NULL
       UNIQUE FK). public_id로 document_submissions.id를 먼저 조회해 넣는다.
     - 마스킹본 컬럼은 `s3_masked_key` — 경로(key)만 저장(s3://버킷 접두사 제거). 조회 시
-      백엔드가 presigned URL 생성. analysis_document_type 컬럼은 results에 없음(submissions 소유).
+      백엔드가 presigned URL 생성.
+    - **`analysis_document_type`은 results에도 있다(v1.1 신규, NOT NULL — 2026-06-07 수정).**
+      이전 전제("submissions 소유라 results엔 없음")는 v1.0 기준 오류 — 백엔드 DocumentResult
+      엔티티가 NOT NULL enum으로 매핑하고 GET /result 응답 변환에서 `.name()`을 바로 호출하므로,
+      이 컬럼 없이 INSERT하면 적재는 돼도 조회가 NPE → COMMON5000(500)으로 터진다(실측).
+      값은 페이로드 대신 **document_submissions의 동일 컬럼에서 가져온다**(백엔드가 제출 시점에
+      검증해 넣은 정본 — 페이로드의 "UNKNOWN" 폴백이 백엔드 enum 변환을 깨는 것 방지).
+      `translated_lang`(v1.1 신규, NULL 허용)도 함께 적재한다.
     - completed_at은 DATETIME NOT NULL — ISO 'T'/'Z' 제거 변환, FAILED(None)면 현재 시각 대체.
     - **document_submissions.status도 함께 갱신한다** (2026-06-05 수정). 백엔드 GET /status
       폴링은 submissions.status(ANALYZING/COMPLETED/FAILED)만 읽으므로, results만 INSERT하면
@@ -321,9 +331,10 @@ def _insert_onprem_mysql(result):
     )
     try:
         with conn.cursor() as cur:
-            # 1) public_id → document_submissions.id (document_results.submission_id FK NOT NULL)
+            # 1) public_id → submissions.id + analysis_document_type
+            #    (results.submission_id FK NOT NULL / analysis_document_type NOT NULL — 정본은 submissions)
             cur.execute(
-                f"SELECT id FROM {TBL_SUBMISSIONS} WHERE public_id=%s",
+                f"SELECT id, analysis_document_type FROM {TBL_SUBMISSIONS} WHERE public_id=%s",
                 (result["document_public_id"],),
             )
             row = cur.fetchone()
@@ -331,36 +342,42 @@ def _insert_onprem_mysql(result):
                 raise ValueError(
                     f"submission not found in onprem DB: public_id={result['document_public_id']}"
                 )
-            submission_id = row[0]
+            submission_id, analysis_document_type = row[0], row[1]
 
             # 2) 결과 UPSERT (submission_id UNIQUE로 멱등).
+            #    created_at/updated_at은 UTC_TIMESTAMP(6) — 백엔드(JPA Auditing)가 UTC로 쓰고
+            #    응답 직렬화 시 UTC로 간주해 'Z'를 붙이므로, 서버 타임존 의존 NOW(6) 대신 UTC 명시.
             cur.execute(
                 f"""
                 INSERT INTO {TBL_RESULTS}
-                    (submission_id, processing_status, overall_risk_level, ocr_confidence,
-                     wage_summary, risk_items, translated_text, s3_masked_key,
-                     failed_reason, completed_at, created_at, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(6),NOW(6))
+                    (submission_id, analysis_document_type, processing_status, overall_risk_level,
+                     ocr_confidence, wage_summary, risk_items, translated_text, translated_lang,
+                     s3_masked_key, failed_reason, completed_at, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))
                 ON DUPLICATE KEY UPDATE
+                    analysis_document_type=VALUES(analysis_document_type),
                     processing_status=VALUES(processing_status),
                     overall_risk_level=VALUES(overall_risk_level),
                     ocr_confidence=VALUES(ocr_confidence),
                     wage_summary=VALUES(wage_summary),
                     risk_items=VALUES(risk_items),
                     translated_text=VALUES(translated_text),
+                    translated_lang=VALUES(translated_lang),
                     s3_masked_key=VALUES(s3_masked_key),
                     failed_reason=VALUES(failed_reason),
                     completed_at=VALUES(completed_at),
-                    updated_at=NOW(6)
+                    updated_at=UTC_TIMESTAMP(6)
                 """,
                 (
                     submission_id,
+                    analysis_document_type,
                     result["processing_status"],
                     result["overall_risk_level"],
                     result["ocr_confidence"],
                     json.dumps(result["wage_summary"], ensure_ascii=False) if result["wage_summary"] else None,
                     json.dumps(result["risk_items"], ensure_ascii=False),
                     result["translated_text"],
+                    result.get("translated_lang"),
                     _s3_uri_to_key(result["masked_file_url"]),
                     failed_reason,
                     completed_at,
@@ -373,7 +390,7 @@ def _insert_onprem_mysql(result):
                 "FAILED" if result["processing_status"] == "FAILED" else "COMPLETED"
             )
             cur.execute(
-                f"UPDATE {TBL_SUBMISSIONS} SET status=%s, updated_at=NOW(6) WHERE id=%s",
+                f"UPDATE {TBL_SUBMISSIONS} SET status=%s, updated_at=UTC_TIMESTAMP(6) WHERE id=%s",
                 (submission_status, submission_id),
             )
         conn.commit()
