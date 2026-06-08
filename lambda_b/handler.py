@@ -149,19 +149,30 @@ def handler(event, context):
         logger.error("missing document_id/source in payload: %s", _redact(event))
         raise ValueError("payload missing document_id/source")
 
-    try:
-        analysis = _analyze(
-            masked_text=masked_text,
-            doc_type=event.get("analysis_document_type") or "UNKNOWN",
-            user_lang=event.get("user_lang") or "ko",
-        )
-    except Exception as e:
-        logger.exception("analysis failed: document_id=%s", document_id)
+    if event.get("precheck_failed"):
+        # Lambda A 사전검증 실패(근로계약서·급여명세서가 아닌 이상한 사진/문서) →
+        # 분석을 건너뛰고 FAILED를 그대로 전파한다. masked_text는 비어 있다(A가 마스킹본 미생성).
+        # 결과 전송·status 갱신은 아래 정상 경로(_build_result→_dispatch)를 그대로 탄다.
+        logger.info("precheck failed from Lambda A: document_id=%s", document_id)
         analysis = {
             "processing_status": "FAILED",
             "risk_items": [],
-            "failed_reason": f"analysis error: {type(e).__name__}",
+            "failed_reason": event.get("failed_reason") or "unsupported document type",
         }
+    else:
+        try:
+            analysis = _analyze(
+                masked_text=masked_text,
+                doc_type=event.get("analysis_document_type") or "UNKNOWN",
+                user_lang=event.get("user_lang") or "ko",
+            )
+        except Exception as e:
+            logger.exception("analysis failed: document_id=%s", document_id)
+            analysis = {
+                "processing_status": "FAILED",
+                "risk_items": [],
+                "failed_reason": f"analysis error: {type(e).__name__}",
+            }
 
     result = _build_result(event, analysis)
     _dispatch(source, event, result)

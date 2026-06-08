@@ -28,4 +28,13 @@ assert doc["document"]["format"] == "pdf"
 img = h._build_content_block(b"\x89PNG\r\n\x1a\n", "x")
 assert img["image"]["format"] == "png"
 
+# 문서유형 판정 분리 (DOCTYPE 첫 줄 → (doc_type, masked_body))
+assert h._split_verdict("DOCTYPE: LABOR_CONTRACT\n성명: [이름-마스킹]") == (
+    "LABOR_CONTRACT", "성명: [이름-마스킹]")
+assert h._split_verdict("DOCTYPE: PAY_STUB\n기본급 [금액]") == ("PAY_STUB", "기본급 [금액]")
+assert h._split_verdict("DOCTYPE: INVALID") == ("INVALID", "")
+assert h._split_verdict("DOCTYPE: SOMETHING_ELSE\n본문") == ("INVALID", "")  # 알 수 없는 코드 → 부적합
+# 판정 줄 형식 위반 → 보수적으로 통과(전체를 본문으로)
+assert h._split_verdict("성명: [이름-마스킹]\n본문") == ("UNKNOWN_FORMAT", "성명: [이름-마스킹]\n본문")
+
 print("all helper assertions passed")

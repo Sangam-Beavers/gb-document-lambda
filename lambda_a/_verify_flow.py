@@ -50,12 +50,16 @@ class FakeS3:
             raise RuntimeError("simulated S3 delete failure")
 
 
+_DEFAULT_VLM_TEXT = "DOCTYPE: LABOR_CONTRACT\n성명: [이름-마스킹]\n월급여: 2,000,000원"
+
+
 class FakeBedrock:
+    def __init__(self, text=_DEFAULT_VLM_TEXT):
+        self._text = text
+
     def converse(self, **kw):
         calls["bedrock"].append(("converse", kw["modelId"]))
-        return {"output": {"message": {"content": [
-            {"text": "근로계약서\n성명: [이름-마스킹]\n월급여: 2,000,000원"}
-        ]}}}
+        return {"output": {"message": {"content": [{"text": self._text}]}}}
 
 
 class FakeLambda:
@@ -66,13 +70,13 @@ class FakeLambda:
         ))
 
 
-_state = {"delete_raises": False}
+_state = {"delete_raises": False, "vlm_text": _DEFAULT_VLM_TEXT}
 
 
 def fake_client(service, **kw):
     return {
         "s3": FakeS3(delete_raises=_state["delete_raises"]),
-        "bedrock-runtime": FakeBedrock(),
+        "bedrock-runtime": FakeBedrock(_state["vlm_text"]),
         "lambda": FakeLambda(),
     }[service]
 
@@ -98,6 +102,7 @@ def _run():
     # 핸들러는 import 시 캐싱된 모듈 전역 클라이언트를 쓰므로, 케이스별 동작은
     # _state로 토글한 새 인스턴스를 모듈 전역에 주입해 반영한다.
     h.s3 = FakeS3(delete_raises=_state["delete_raises"])
+    h.bedrock = FakeBedrock(_state["vlm_text"])
     return h.handler(EVENT, None)
 
 
@@ -155,6 +160,27 @@ out3 = h._process_object("gb-upload", "masked/doc-123.txt")
 assert out3 == {"key": "masked/doc-123.txt", "skipped": "masked-artifact"}
 assert calls["s3"] == []                        # head_object조차 안 함 (삭제도 당연히 안 함)
 
+# ════════ 케이스 4: 이상한 사진(INVALID) = 사전검증 실패 ════════
+# 근로계약서·급여명세서가 아니면: 마스킹본 미생성(put 없음) + 원본 미삭제(delete 없음).
+# 단, FAILED를 status로 전파하도록 Lambda B는 precheck_failed=True로 invoke 한다.
+_state["delete_raises"] = False
+_state["vlm_text"] = "DOCTYPE: INVALID"
+out4 = _run()
+ops4 = [c[0] for c in calls["s3"]]
+assert "put_object" not in ops4, "INVALID면 마스킹본을 만들면 안 됨"       # 마스킹본 미생성
+assert "delete_object" not in ops4, "INVALID면 원본을 삭제하면 안 됨(7일 수명주기로 소멸)"  # 원본 보존
+assert ops4 == ["head_object", "get_object"], ops4
+assert len(calls["lambda"]) == 1                                          # FAILED 전파용 B invoke
+_, _, inv_type4, payload4 = calls["lambda"][0]
+assert inv_type4 == "Event"
+assert payload4["precheck_failed"] is True
+assert payload4["masked_text"] == "" and payload4["masked_file_url"] == ""
+assert out4["processed"][0] == {
+    "key": "original/doc-123.pdf", "document_id": "doc-123", "precheck_failed": True
+}, out4["processed"][0]
+_state["vlm_text"] = _DEFAULT_VLM_TEXT  # 상태 복원
+
 print("OK [1] OCR+PII -> masked/ put -> original/ delete -> Lambda B Event invoke (순서/대상키 검증)")
 print("OK [2] 원본 삭제 실패해도 best-effort (예외 없이 B invoke 진행)")
 print("OK [3] masked/ 산출물은 재트리거 스킵 (원본 삭제 오발 방지)")
+print("OK [4] INVALID 사진 -> 마스킹본/원본삭제 없음 + precheck_failed로 B에 FAILED 전파")
