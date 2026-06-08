@@ -60,4 +60,27 @@ assert h._s3_uri_to_key("") is None
 assert "masked_text" not in h._redact(event)
 assert h._redact(event)["document_id"] == "doc-1"
 
+# 금액 정규화 — 백엔드 BigDecimal 계약 보호(2026-06-08 "약 103,500원" 500 회귀 방지)
+assert h._normalize_amount("약 103,500원") == "103500", h._normalize_amount("약 103,500원")
+assert h._normalize_amount("2,000,000원") == "2000000"
+assert h._normalize_amount("9620") == "9620"
+assert h._normalize_amount(1500) == "1500"
+assert h._normalize_amount(None) is None
+assert h._normalize_amount("") is None
+assert h._normalize_amount("N/A") is None
+assert h._normalize_amount("-90000") == "-90000"
+# wage_summary 전체 정규화 + _build_result 경유 적용 확인
+wage = h._sanitize_wage_summary({
+    "currency_code": "KRW", "monthly_wage": "약 2,000,000원", "hourly_wage": "9,620원",
+    "deductions": [{"name": "national_pension", "amount": "약 103,500원"}],
+})
+assert wage["monthly_wage"] == "2000000", wage
+assert wage["hourly_wage"] == "9620", wage
+assert wage["deductions"][0]["amount"] == "103500", wage
+res_w = h._build_result(event, {
+    "processing_status": "COMPLETED", "risk_items": [],
+    "wage_summary": {"currency_code": "KRW", "deductions": [{"name": "x", "amount": "약 7만원"}]},
+})
+assert res_w["wage_summary"]["deductions"][0]["amount"] == "7", res_w["wage_summary"]
+
 print("all helper assertions passed")

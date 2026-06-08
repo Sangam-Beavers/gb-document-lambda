@@ -21,7 +21,9 @@ B는 페이로드의 masked_text로만 분석하므로 원본을 갖지 않는�
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import boto3
 
@@ -97,15 +99,15 @@ TOOLS = [
                             "type": ["object", "null"],
                             "properties": {
                                 "currency_code": {"type": "string", "description": "ISO 4217 (예: KRW)"},
-                                "monthly_wage": {"type": ["string", "null"], "description": "십진수 문자열"},
-                                "hourly_wage": {"type": ["string", "null"], "description": "십진수 문자열"},
+                                "monthly_wage": {"type": ["string", "null"], "description": "순수 십진수 문자열만(예: \"2000000\"). 통화기호·콤마·단위·'약' 금지. 모르면 null"},
+                                "hourly_wage": {"type": ["string", "null"], "description": "순수 십진수 문자열만(예: \"9620\"). 통화기호·콤마·단위·'약' 금지. 모르면 null"},
                                 "deductions": {
                                     "type": "array",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "name": {"type": "string"},
-                                            "amount": {"type": "string"},
+                                            "amount": {"type": "string", "description": "순수 십진수 문자열만(예: \"103500\"). 통화기호·콤마·단위·'약' 금지"},
                                         },
                                         "required": ["name", "amount"],
                                     },
@@ -242,7 +244,9 @@ def _build_result(event, analysis):
         "processing_status": status,
         "overall_risk_level": analysis.get("overall_risk_level"),
         "ocr_confidence": analysis.get("ocr_confidence"),
-        "wage_summary": analysis.get("wage_summary"),
+        # 금액은 백엔드 BigDecimal 계약(string decimal, §3-1)에 맞게 정규화한다 — 모델이 종종
+        # "약 103,500원"처럼 표시용 문자열을 뱉어 백엔드 역직렬화를 깨뜨린다(2026-06-08 실측).
+        "wage_summary": _sanitize_wage_summary(analysis.get("wage_summary")),
         "risk_items": analysis.get("risk_items", []),
         "translated_text": analysis.get("translated_text"),
         # 번역 대상 언어 = user_lang (v1.1 필수 필드, 데모 "ko" 고정).
@@ -401,6 +405,44 @@ def _insert_onprem_mysql(result):
         raise
     finally:
         conn.close()
+
+
+# ── 금액 정규화 (백엔드 BigDecimal 계약 보호) ──────────────────────────
+_NON_NUMERIC = re.compile(r"[^0-9.\-]")
+
+
+def _normalize_amount(value):
+    """금액을 깨끗한 decimal 문자열로 정규화. 통화기호·콤마·공백·한글 등 비숫자 제거.
+
+    백엔드 document_results의 wage_summary는 BigDecimal 필드로 매핑되며, 스키마 합의(§3-1)는
+    monthly_wage/hourly_wage/deductions[].amount를 'string(decimal)'로 규정한다. 모델이
+    "약 103,500원" 같은 표시용 문자열을 넣으면 백엔드 역직렬화가 깨져 그 행이 섞인 조회 전체가
+    500(개발 읽기)/DLQ(운영 SQS 수신)로 떨어진다. 파싱 불가/빈 값은 None('정보 없음')으로 둔다.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):  # bool은 int 하위형 — 금액 아님, 방어.
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    cleaned = _NON_NUMERIC.sub("", str(value))
+    if cleaned in ("", "-", ".", "-.", "."):
+        return None
+    try:
+        return str(Decimal(cleaned))  # 중복 소수점 등은 InvalidOperation으로 걸러진다.
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _sanitize_wage_summary(wage):
+    """wage_summary 내 모든 금액 필드를 _normalize_amount로 정규화한다(없으면 그대로 반환)."""
+    if not wage:
+        return wage
+    wage["monthly_wage"] = _normalize_amount(wage.get("monthly_wage"))
+    wage["hourly_wage"] = _normalize_amount(wage.get("hourly_wage"))
+    for deduction in wage.get("deductions") or []:
+        deduction["amount"] = _normalize_amount(deduction.get("amount"))
+    return wage
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────
