@@ -244,21 +244,48 @@ def _kb_lookup(query_text):
         return "법령 조회에 실패했습니다. 일반 지식으로 보수적으로 판단하고 계속하세요."
 
 
+# risk_level 심각도 순서 — 백엔드 §3-2: overall_risk_level == max(risk_items[].risk_level).
+_RISK_SEVERITY = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def _reconcile_overall_risk(risk_items):
+    """overall_risk_level을 risk_items의 최대 심각도로 결정적으로 보정한다.
+
+    백엔드 Consumer가 §3-2(overall == max(items))를 강제 검증한다. 그런데 LLM이 종종 개별
+    항목은 HIGH로 찍고 전체는 MEDIUM으로 답하는 불일치를 낸다(2026-06-13 실측: overall=MEDIUM,
+    max(items)=HIGH → ingest 실패 + SQS 무한 재시도로 문서가 "분석 중"에서 멈춤). 모델 프롬프트에
+    의존하지 않고 발행 직전 코드로 보정해 불변식을 항상 만족시킨다.
+
+    - risk_items 비었으면 → None (§3-2: 빈 항목이면 overall은 null)
+    - 있으면 → 최대 심각도(HIGH>MEDIUM>LOW)
+    """
+    levels = [
+        it.get("risk_level")
+        for it in (risk_items or [])
+        if it.get("risk_level") in _RISK_SEVERITY
+    ]
+    if not levels:
+        return None
+    return max(levels, key=lambda lv: _RISK_SEVERITY[lv])
+
+
 # ── 결과 JSON 조립 (document_results 컬럼 매핑) ─────────────────────────
 def _build_result(event, analysis):
     """모델 산출 + 파이프라인 메타를 합쳐 백엔드 계약 JSON으로 만든다."""
     status = analysis.get("processing_status", "COMPLETED")
+    risk_items = analysis.get("risk_items", [])
     return {
         "schema_version": "1.1",  # result-json-schema-agreement.md §2 — Consumer가 검증하는 필수 필드
         "document_public_id": event.get("document_id"),
         "analysis_document_type": event.get("analysis_document_type") or "UNKNOWN",
         "processing_status": status,
-        "overall_risk_level": analysis.get("overall_risk_level"),
+        # §3-2 불변식 강제 — LLM 값이 아니라 risk_items 최대 심각도로 결정적 보정(_reconcile_overall_risk).
+        "overall_risk_level": _reconcile_overall_risk(risk_items),
         "ocr_confidence": analysis.get("ocr_confidence"),
         # 금액은 백엔드 BigDecimal 계약(string decimal, §3-1)에 맞게 정규화한다 — 모델이 종종
         # "약 103,500원"처럼 표시용 문자열을 뱉어 백엔드 역직렬화를 깨뜨린다(2026-06-08 실측).
         "wage_summary": _sanitize_wage_summary(analysis.get("wage_summary")),
-        "risk_items": analysis.get("risk_items", []),
+        "risk_items": risk_items,
         "translated_text": analysis.get("translated_text"),
         # 번역 대상 언어 = user_lang (v1.1 필수 필드, 데모 "ko" 고정).
         "translated_lang": event.get("user_lang") or "ko",
